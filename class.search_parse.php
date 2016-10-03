@@ -1,9 +1,10 @@
 <?php
 /**
- * class SearchParse, to optimize / filtering of search words
+ * class WP_SearchParse, to optimize | searching | filtering of search words
  *
- * @link   http://devdiamond.com/
- * @author DevDiamond <me@devdiamond.com>
+ * @link    https://github.com/DevDiamondCom/WP_SearchParse
+ * @version 1.1.0
+ * @author  DevDiamond <me@devdiamond.com>
  */
 class WP_SearchParse
 {
@@ -19,14 +20,17 @@ class WP_SearchParse
 	CONST NOUN = '/(а|ев|ов|ие|ье|е|иями|ями|ами|еи|ии|и|ией|ей|ой|ий|й|и|ы|ь|ию|ью|ю|ия|ья|я)$/u';
 	CONST DERIVATIONAL = '/[^аеиоуыэюя][аеиоуыэюя]+[^аеиоуыэюя]+[аеиоуыэюя].*(?<=о)сть?$/u';
 
+	private static $search_phrase = '';
+	private static $search_cache;
+
 	/**
 	 * Search filter on post title
 	 *
-	 * @param string $like_type  - "AND" or "OR"
+	 * @param string $is_occurrences  - FALSe => "AND", TRUE => "OR"
 	 */
-	public static function search_set_filter_post_title( $like_type = 'AND' )
+	public static function search_set_filter_post_title( $is_occurrences )
 	{
-		$like_type = ($like_type === 'OR' ? 'OR' : 'AND');
+		$like_type = ($is_occurrences ? 'OR' : 'AND');
 
 		add_filter('posts_search', function( $search, &$wp_query ) use ( $like_type )
 		{
@@ -55,31 +59,35 @@ class WP_SearchParse
 	/**
 	 * Parse StopWords
 	 *
-	 * @param string $search_content    - Search content
-	 * @param string $stopwords         - SopWords list prescribed by a comma separated, space, or new line
-	 * @param bool   $is_stemmer        - OFF/ON Stemmer filter
-	 * @param bool   $is_count_keyword  - OFF/ON Max 9 keyword
+	 * @param string    $search_content    - Search content
+	 * @param string    $stopwords         - SopWords list prescribed by a comma separated, space, or new line
+	 * @param int       $min_characters    - Min count characters
+	 * @param bool|true $is_stemmer        - OFF/ON Stemmer filter
+	 * @param bool|true $is_count_keyword  - OFF/ON Max 9 keyword
 	 *
 	 * @return string
 	 */
-	public static function parse_stopwords( $search_content, $stopwords, $is_stemmer = false, $is_count_keyword = false )
+	public static function parse_stopwords( $search_content, $stopwords, $min_characters = 3, $is_stemmer = true, $is_count_keyword = true )
 	{
 		if ( ! is_string($search_content) || empty($search_content) ||
 			 ! is_string($stopwords) || empty($stopwords) )
 			return '';
 
+		$min_characters = (int) $min_characters;
+
 		# StopWords
-		$stopwords = trim( preg_replace("/(\s|\r\n|\r|\n)+/im", ',', $stopwords), ',' );
-		$stopwords = preg_replace("/\*/i", '(.*?)', $stopwords);
+		$stopwords = trim( preg_replace("/(\s|\r\n|\r|\n)+/imu", ',', $stopwords), ',' );
+		$stopwords = preg_replace("/\*/iu", '(.*?)', $stopwords);
 		$stopwords = explode(',', $stopwords);
-		$search_content = ' '.$search_content.' ';
+
+		$search_content = preg_replace("/(\.|\,|\:|\;|\?|\!|\-|\"|\')+/u", ' ', $search_content);
 		foreach ( $stopwords as $f_word )
-			$search_content = preg_replace("/\s". $f_word ."\s/i", ' ', $search_content);
+			$search_content = preg_replace("/(^|\s)". $f_word ."(\s|$)/iu", ' ', $search_content);
 
 		# Filter words
 		if ( preg_match_all( '/".*?("|$)|((?<=[\t ",+])|^)[^\t ",+]+/', $search_content, $matches ) )
 		{
-			$search_terms = self::parse_search_terms( $matches[0], $is_stemmer );
+			$search_terms = self::parse_search_terms( $matches[0], $min_characters, $is_stemmer );
 			$search_terms = array_unique( $search_terms, SORT_STRING );
 			if ($is_count_keyword)
 			{
@@ -97,14 +105,133 @@ class WP_SearchParse
 	}
 
 	/**
+	 * @param array $wp_query_args  - WP_Query class data
+	 * @param array $search_columns - Search columns. "post_title", "post_excerpt", "post_content"
+	 *
+	 * @return WP_Query
+	 */
+	public static function semantic_search( &$wp_query_args, $search_columns )
+	{
+		if ( ! isset( $wp_query_args['s'] ) || ! is_string($wp_query_args['s']) || $wp_query_args['s'] == '' )
+			return new WP_Query();
+
+		if ( ! ($is_post_title = in_array('post_title', $search_columns)) &&
+			 ! ($is_post_excerpt = in_array('post_excerpt', $search_columns)) &&
+			 ! ($is_post_content = in_array('post_content', $search_columns)) )
+			return new WP_Query();
+
+		$search_terms = explode(' ', $wp_query_args['s']);
+		if ( count( $search_terms ) > 9 )
+			$search_terms = array_slice( $search_terms, 0, 9, true );
+
+		if ( ! isset($wp_query_args['posts_per_page']) || 1 > (int) $wp_query_args['posts_per_page'] )
+		{
+			if ( 1 > ($wp_query_args['posts_per_page'] = get_option( 'posts_per_page' )) )
+				return new WP_Query();
+		}
+
+		if ( self::$search_phrase == $wp_query_args['s'] && isset(self::$search_cache) )
+			return self::$search_cache;
+		self::$search_phrase = $wp_query_args['s'];
+
+		if ( count( $search_terms ) < 2 )
+		{
+			$wp_query_args['showposts'] = $wp_query_args['posts_per_page'];
+			return new WP_Query($wp_query_args);
+		}
+
+		global $wpdb;
+
+		$search_w = '';
+
+		// post_type
+		if ( isset($wp_query_args['post_type']) )
+			$search_w .= "post_type IN ('" . join("', '", (array) $wp_query_args['post_type']) . "')";
+
+		// post_status
+		if ( isset($wp_query_args['post_status']) )
+		{
+			$q_status = (array) $wp_query_args['post_status'];
+			if ( in_array( 'any', $q_status ) )
+			{
+				foreach ( get_post_stati() as $status )
+				{
+					if ( ! in_array( $status, $q_status ) )
+						$q_status[] = $status;
+				}
+			}
+			$search_w .= ($search_w ? ' AND ' : '') . "post_status IN ('" . join("', '", $q_status) . "')";
+		}
+
+		// post__not_in
+		if ( isset($wp_query_args['post__not_in']) )
+		{
+			$post__not_in = implode(',',  array_map( 'absint', $wp_query_args['post__not_in'] ));
+			$search_w .= ($search_w ? ' AND ' : '') . "ID NOT IN ($post__not_in)";
+		}
+
+		if ($search_w)
+			$search_w .= ' AND ';
+
+		// UNION and LIKE
+		$is_logged = is_user_logged_in();
+		$search = '';
+		foreach ( $search_terms as $term )
+		{
+			$search_l = '';
+			$term = esc_sql($wpdb->esc_like($term));
+			if ( $is_post_title )
+				$search_l .= "(post_title LIKE '%{$term}%')";
+			if ( $is_post_excerpt )
+				$search_l .= ($search_l ? ' OR ' : '')."(post_excerpt LIKE '%{$term}%')";
+			if ( $is_post_content )
+				$search_l .= ($search_l ? ' OR ' : '')."(post_content LIKE '%{$term}%')";
+			$search .= ($search ? "\n UNION ALL \n" : '') . "SELECT ID FROM {$wpdb->posts} WHERE {$search_w}({$search_l})";
+			if ( ! $is_logged )
+				$search .= " AND (post_password = '')";
+		}
+
+		// order => DESC
+		if ( isset($wp_query_args['order']) && $wp_query_args['order'] === 'DESC' )
+			$search .= "\n ORDER BY ID DESC";
+
+		$query_res = $wpdb->get_results( $search );
+		if ( empty($query_res) )
+			return new WP_Query();
+
+		$arrQ = [];
+		foreach ( $query_res as $qVal )
+			$arrQ[ $qVal->ID ] = isset($arrQ[ $qVal->ID ]) ? ($arrQ[ $qVal->ID ] + 1) : 1;
+
+		if (arsort($arrQ,SORT_NUMERIC))
+		{
+			$found_posts = count($arrQ);
+			$arrQ = array_slice( $arrQ, 0, $wp_query_args['posts_per_page'], true );
+			unset($wp_query_args['s']);
+			$wp_query_args['post__in'] = array_keys($arrQ);
+			$query = new WP_Query($wp_query_args);
+			$query->found_posts = $found_posts;
+			$query->max_num_pages = ($found_posts / $wp_query_args['posts_per_page']);
+		}
+		else
+		{
+			$query = new WP_Query();
+		}
+
+		self::$search_cache = $query;
+		return $query;
+	}
+
+	/**
 	 * Check if the terms are suitable for searching.
 	 *
-	 * @param array $terms       - Terms to check.
-	 * @param bool  $is_stemmer  - OFF/ON Stemmer filter
+	 * @param array $terms           - Terms to check.
+	 * @param int   $min_characters  - Min count characters
+	 * @param bool  $is_stemmer      - OFF/ON Stemmer filter
 	 *
 	 * @return array - Checked Terms
 	 */
-	private static function parse_search_terms( $terms, $is_stemmer )
+	private static function parse_search_terms( $terms, $min_characters, $is_stemmer )
 	{
 		$checked = array();
 
@@ -168,6 +295,9 @@ class WP_SearchParse
 				if ( empty($term) )
 					continue;
 			}
+
+			if ( mb_strlen($term) < $min_characters )
+				continue;
 
 			$checked[] = $term;
 		}
